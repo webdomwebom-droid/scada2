@@ -87,6 +87,7 @@ class VPNServiceV2:
         self.ssh_client = None
         self.ssh_transport = None
         self._vpn_connection_name = None
+        self._swan_conn_name_active = None
 
         # Estado de persistencia de la conexion VPN (reutilizacion entre operaciones)
         self._connected_plant = None
@@ -101,6 +102,7 @@ class VPNServiceV2:
         self.openfortivpn_exe = shutil.which('openfortivpn')
         self.openconnect_exe = self._find_openconnect()
         self.windows_vpn_available = self._check_windows_vpn_available()
+        self.swanctl_exe = None if os.name == 'nt' else shutil.which('swanctl')
 
         self.demo_mode = settings.DEMO_MODE
         self.available_vpn_methods = self._detect_available_methods()
@@ -123,8 +125,12 @@ class VPNServiceV2:
             methods.append('openconnect')
         if self.windows_vpn_available:
             methods.append('windows_vpn')
+        if self.swanctl_exe:
+            methods.append('strongswan')
         methods.append('ssh')  # SSH via paramiko siempre disponible (librería instalada)
-        if self.demo_mode or (not self.openvpn_exe and not self.openfortivpn_exe and not self.windows_vpn_available):
+        # 'demo' solo si está explícitamente activado: en producción una VPN que falla
+        # debe dar error, no fingir que hay túnel y dejar los Modbus sin respuesta.
+        if self.demo_mode:
             methods.append('demo')
         return methods
 
@@ -831,7 +837,14 @@ class VPNServiceV2:
             logger.info(f"Conectando FortiClient VPN: {vpn_name} (tipo: {subtype})")
 
             if subtype == 'ipsec':
-                return await self._connect_ipsec_windows(config, plant_name, routes)
+                if os.name == 'nt':
+                    return await self._connect_ipsec_windows(config, plant_name, routes)
+                if self.swanctl_exe:
+                    return await self._connect_ipsec_strongswan(config, plant_name, routes)
+                logger.error(
+                    "IPsec requiere strongSwan (swanctl) en Linux o Windows VPN nativa; "
+                    "instala strongswan (apt install strongswan strongswan-swanctl)")
+                return False
             else:
                 return await self._connect_ssl_openfortivpn(config, plant_name)
 
@@ -840,6 +853,181 @@ class VPNServiceV2:
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    # =================================================================
+    # IPsec en Linux via strongSwan (swanctl)
+    # =================================================================
+
+    @staticmethod
+    def _swan_conn_name(plant_name: str) -> str:
+        safe = ''.join(c if c.isalnum() else '-' for c in (plant_name or 'vpn')).strip('-').lower()
+        return f"scada-{safe or 'vpn'}"
+
+    @staticmethod
+    def _swan_proposal(proposal: str, dh_group: str) -> str:
+        """'AES256-SHA512' + grupo DH 14 -> 'aes256-sha512-modp2048'."""
+        dh_map = {'1': 'modp768', '2': 'modp1024', '5': 'modp1536', '14': 'modp2048',
+                  '15': 'modp3072', '16': 'modp4096', '19': 'ecp256', '20': 'ecp384',
+                  '21': 'ecp521'}
+        parts = [p.strip().lower() for p in (proposal or 'AES256-SHA256').split('-') if p.strip()]
+        dh = dh_map.get(str(dh_group or '14').strip(), 'modp2048')
+        return '-'.join(parts + [dh])
+
+    def _build_swanctl_conf(self, config: VPNConfig, conn_name: str,
+                            routes: List[str] = None) -> str:
+        """Genera la configuración swanctl equivalente al perfil IPsec de FortiClient."""
+        host = config.get('HOST')
+        user = config.get('USER', '')
+        psk = config.get('PSK', '')
+        secret = config.get('PRIVATE_KEY') or config.get('PASSWORD') or ''
+        local_id = config.get('LOCAL_ID') or user
+        version = '1' if str(config.get('IKE_VERSION', 'v2')).lower() in ('1', 'v1') else '2'
+        ike_prop = self._swan_proposal(config.get('PHASE1_PROPOSAL'), config.get('PHASE1_DH_GROUP'))
+        esp_prop = self._swan_proposal(config.get('PHASE2_PROPOSAL'), config.get('PHASE2_DH_GROUP'))
+        remote_ts = ', '.join(routes) if routes else '0.0.0.0/0'
+
+        if version == '2':
+            local_blocks = (
+                f"      local-psk {{\n"
+                f"        auth = psk\n"
+                f"        id = {local_id}\n"
+                f"      }}\n"
+                f"      local-eap {{\n"
+                f"        auth = eap-mschapv2\n"
+                f"        eap_id = {user}\n"
+                f"      }}\n"
+            )
+            extra = ""
+        else:
+            local_blocks = (
+                f"      local-psk {{\n"
+                f"        auth = psk\n"
+                f"        id = {local_id}\n"
+                f"      }}\n"
+                f"      local-xauth {{\n"
+                f"        auth = xauth\n"
+                f"        xauth_id = {user}\n"
+                f"      }}\n"
+            )
+            extra = "    aggressive = yes\n"
+
+        return (
+            f"connections {{\n"
+            f"  {conn_name} {{\n"
+            f"    version = {version}\n"
+            f"    remote_addrs = {host}\n"
+            f"    proposals = {ike_prop}\n"
+            f"    vips = 0.0.0.0\n"
+            f"    dpd_delay = 30s\n"
+            f"{extra}"
+            f"    local {{\n"
+            f"{local_blocks}"
+            f"    }}\n"
+            f"    remote {{\n"
+            f"      auth = psk\n"
+            f"      id = {host}\n"
+            f"    }}\n"
+            f"    children {{\n"
+            f"      {conn_name} {{\n"
+            f"        remote_ts = {remote_ts}\n"
+            f"        esp_proposals = {esp_prop}\n"
+            f"        start_action = none\n"
+            f"        dpd_action = restart\n"
+            f"      }}\n"
+            f"    }}\n"
+            f"  }}\n"
+            f"}}\n"
+            f"secrets {{\n"
+            f"  ike-{conn_name} {{\n"
+            f"    id = {host}\n"
+            f"    secret = \"{psk}\"\n"
+            f"  }}\n"
+            f"  eap-{conn_name} {{\n"
+            f"    id = {user}\n"
+            f"    secret = \"{secret}\"\n"
+            f"  }}\n"
+            f"  xauth-{conn_name} {{\n"
+            f"    id = {user}\n"
+            f"    secret = \"{secret}\"\n"
+            f"  }}\n"
+            f"}}\n"
+        )
+
+    async def _run_privileged(self, args: List[str], timeout: int = 60) -> Tuple[int, str]:
+        """Ejecuta un comando como root (directo si ya lo somos, si no via sudo -n)."""
+        if os.geteuid() != 0:
+            if not shutil.which('sudo'):
+                return 1, 'se requieren privilegios de root y no hay sudo disponible'
+            args = ['sudo', '-n'] + args
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return proc.returncode, (out or b'').decode('utf-8', errors='replace')
+        except asyncio.TimeoutError:
+            return 1, f'timeout ejecutando {args[0]}'
+        except Exception as e:
+            return 1, str(e)
+
+    async def _connect_ipsec_strongswan(self, config: VPNConfig, plant_name: str,
+                                        routes: List[str] = None) -> bool:
+        """IPsec (FortiGate dialup) en Linux usando strongSwan/swanctl."""
+        conn_name = self._swan_conn_name(plant_name)
+        conf_dir = '/etc/swanctl/conf.d'
+        conf_path = os.path.join(conf_dir, f'{conn_name}.conf')
+        content = self._build_swanctl_conf(config, conn_name, routes)
+
+        tmp = tempfile.NamedTemporaryFile('w', suffix='.conf', delete=False)
+        try:
+            tmp.write(content)
+            tmp.close()
+            os.chmod(tmp.name, 0o600)
+            rc, out = await self._run_privileged(['mkdir', '-p', conf_dir], timeout=15)
+            if rc != 0:
+                logger.error(f"strongSwan: no se pudo preparar {conf_dir}: {out.strip()}")
+                return False
+            rc, out = await self._run_privileged(['install', '-m', '600', tmp.name, conf_path],
+                                                 timeout=15)
+            if rc != 0:
+                logger.error(f"strongSwan: no se pudo instalar la configuración: {out.strip()}")
+                return False
+        finally:
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
+
+        rc, out = await self._run_privileged([self.swanctl_exe, '--load-all'], timeout=30)
+        if rc != 0:
+            logger.error(f"strongSwan: fallo cargando configuración: {out.strip()}")
+            return False
+
+        rc, out = await self._run_privileged(
+            [self.swanctl_exe, '--initiate', '--child', conn_name, '--timeout', '60'], timeout=90)
+        if rc != 0:
+            logger.error(f"strongSwan: no se pudo establecer el túnel {conn_name}: {out.strip()}")
+            await self._run_privileged([self.swanctl_exe, '--terminate', '--ike', conn_name],
+                                       timeout=30)
+            return False
+
+        self.vpn_connected = True
+        self.connection_start_time = time.time()
+        self.current_plant_name = plant_name
+        self.current_vpn_config = config
+        self._swan_conn_name_active = conn_name
+        logger.info(f"IPsec strongSwan conectado: {plant_name} ({conn_name})")
+        return True
+
+    async def _disconnect_strongswan(self):
+        conn_name = getattr(self, '_swan_conn_name_active', None)
+        if not conn_name or not self.swanctl_exe:
+            return
+        await self._run_privileged([self.swanctl_exe, '--terminate', '--ike', conn_name],
+                                   timeout=30)
+        await self._run_privileged(['rm', '-f', f'/etc/swanctl/conf.d/{conn_name}.conf'],
+                                   timeout=15)
+        await self._run_privileged([self.swanctl_exe, '--load-all'], timeout=30)
+        self._swan_conn_name_active = None
 
     async def connect_ssh(self, config: VPNConfig, plant_name: str, gateways: List[str] = None) -> bool:
         """
@@ -1196,6 +1384,12 @@ class VPNServiceV2:
                 except:
                     pass
                 self.ssh_client = None
+
+            # Cerrar túnel IPsec de strongSwan si existe
+            try:
+                await self._disconnect_strongswan()
+            except Exception as e:
+                logger.debug(f"Error cerrando strongSwan: {e}")
 
             # Matar proceso OpenVPN directo
             if self.current_vpn_process:

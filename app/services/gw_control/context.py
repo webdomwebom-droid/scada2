@@ -12,6 +12,7 @@ from app.models.gateway import Gateway
 from app.services.vpn_service_v2 import vpn_service
 from app.services.modbus_service_v2 import modbus_service
 from app.services.gw_control.protocol import ModbusTcpClient
+from app.services.gw_control import operations
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,48 @@ async def _connect_plant_vpn(gateway: Gateway) -> bool:
 
 def _make_client(gateway: Gateway) -> ModbusTcpClient:
     port = int(settings.MODBUS_PORT)
-    return ModbusTcpClient(ip=gateway.ip, port=port)
+    return ModbusTcpClient(ip=gateway.ip, port=port,
+                           unit=int(settings.GW_CONTROL_UNIT_ID))
+
+
+async def reconnect_gateway(gateway_id: int) -> dict:
+    """
+    Fuerza una reconexión completa: cierra la VPN actual, limpia la caché de la
+    tabla CB y vuelve a conectar. Pensado para trabajo en campo, cuando el túnel
+    se queda colgado y las operaciones dejan de responder.
+    """
+    db = SessionLocal()
+    try:
+        gateway = db.query(Gateway).filter(Gateway.id == gateway_id).first()
+        if gateway is None:
+            return {"ok": False, "error": "Gateway no encontrado"}
+        plant_name = gateway.plant.name if gateway.plant else None
+        try:
+            await vpn_service.disconnect_vpn()
+        except Exception as e:
+            logger.warning(f"Error desconectando VPN antes de reconectar: {e}")
+        operations._CB_CACHE.clear()
+        modbus_service.set_ssh_transport(None)
+        if not await _connect_plant_vpn(gateway):
+            return {"ok": False, "error": "No se pudo reconectar la VPN de la planta",
+                    "plant": plant_name}
+        client = _make_client(gateway)
+        try:
+            status = await asyncio.to_thread(operations.read_gw_status, client)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        if status is None:
+            return {"ok": False, "error": "VPN conectada pero el gateway no responde por Modbus",
+                    "plant": plant_name, "vpn_connected": True}
+        return {"ok": True, "plant": plant_name, "vpn_connected": True, "status": status}
+    except Exception as e:
+        logger.error(f"Error reconectando gateway {gateway_id}: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
 
 
 async def run_gateway_op(gateway_id: int, op, *args, **kwargs):

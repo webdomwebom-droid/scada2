@@ -7,7 +7,7 @@ import base64
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -19,7 +19,8 @@ from app.models.plant import Plant
 from app.services.gw_control import operations as ops
 from app.services.gw_control import constants as A
 from app.services.gw_control import codecs
-from app.services.gw_control.context import run_gateway_op
+from app.services.gw_control.context import run_gateway_op, reconnect_gateway
+from app.services.vpn_service_v2 import vpn_service
 
 logger = logging.getLogger(__name__)
 
@@ -99,25 +100,71 @@ def _get_gateway(db: Session, gateway_id: int) -> Gateway:
     return gateway
 
 
+def _slave_op(cb_id: int, mac: Optional[str], op, *args, **kwargs):
+    """Resuelve el item CB (id + MAC) y ejecuta la operación sobre ese esclavo."""
+    def _wrap(client):
+        cb = ops.resolve_cb(client, cb_id, mac)
+        if cb is None:
+            return {"ok": False, "error": f"Esclavo CB#{cb_id} no está en la tabla CB del gateway"}
+        return op(client, cb, *args, **kwargs)
+    return _wrap
+
+
+def _check(result):
+    if result is None:
+        raise HTTPException(status_code=502, detail="Sin respuesta del gateway (¿VPN conectada?)")
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise HTTPException(status_code=502, detail=result.get("error", "Error de conexión"))
+    return result
+
+
 # =====================================================================
 # Operaciones de nivel gateway (estado, config, comandos)
 # =====================================================================
+
+@router.get("/{gateway_id}/connection")
+async def gateway_connection(gateway_id: int, db: Session = Depends(get_db),
+                             current_user: User = Depends(get_current_user)):
+    """Estado de la VPN/túnel usado por este gateway (sin tocar el gateway)."""
+    gateway = _get_gateway(db, gateway_id)
+    plant_name = gateway.plant.name if gateway.plant else None
+    return {
+        "plant": plant_name,
+        "gateway_ip": gateway.ip,
+        "vpn_connected": bool(vpn_service.vpn_connected),
+        "vpn_plant": vpn_service.current_plant_name,
+        "vpn_ready": bool(vpn_service.vpn_connected and plant_name
+                          and vpn_service.is_connected_to(plant_name)),
+        "method": (vpn_service.current_vpn_config.vpn_type
+                   if vpn_service.current_vpn_config else None),
+        "uptime_seconds": vpn_service.get_connection_uptime(),
+        "demo": bool(vpn_service.demo_mode),
+    }
+
+
+@router.post("/{gateway_id}/reconnect")
+async def gateway_reconnect(gateway_id: int, db: Session = Depends(get_db),
+                            current_user: User = Depends(get_current_user)):
+    """Reconecta la VPN de la planta y verifica el gateway (botón de campo)."""
+    _get_gateway(db, gateway_id)
+    result = await reconnect_gateway(gateway_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error", "No se pudo reconectar"))
+    return result
+
 
 @router.get("/{gateway_id}/status")
 async def gateway_status(gateway_id: int, db: Session = Depends(get_db),
                          current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-    result = await run_gateway_op(gateway_id, ops.read_gw_status)
-    if isinstance(result, dict) and result.get("ok") is False:
-        raise HTTPException(status_code=502, detail=result.get("error", "Error de conexión"))
-    return result
+    return _check(await run_gateway_op(gateway_id, ops.read_gw_status))
 
 
 @router.get("/{gateway_id}/firmware")
 async def gateway_firmware(gateway_id: int, db: Session = Depends(get_db),
                            current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-    result = await run_gateway_op(gateway_id, ops.read_version)
+    result = _check(await run_gateway_op(gateway_id, ops.read_version))
     return {"version": result}
 
 
@@ -125,10 +172,7 @@ async def gateway_firmware(gateway_id: int, db: Session = Depends(get_db),
 async def gateway_sys_config(gateway_id: int, db: Session = Depends(get_db),
                              current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-    result = await run_gateway_op(gateway_id, ops.read_sys_config)
-    if isinstance(result, dict) and result.get("ok") is False:
-        raise HTTPException(status_code=502, detail=result.get("error"))
-    return result
+    return _check(await run_gateway_op(gateway_id, ops.read_sys_config))
 
 
 @router.post("/{gateway_id}/mode")
@@ -185,134 +229,106 @@ async def gateway_cb_table(gateway_id: int, db: Session = Depends(get_db),
 # =====================================================================
 
 @router.get("/{gateway_id}/slaves/{cb_id}/lora")
-async def slave_lora_conf(gateway_id: int, cb_id: int,
+async def slave_lora_conf(gateway_id: int, cb_id: int, mac: Optional[str] = None,
                           db: Session = Depends(get_db),
                           current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        cb = {"id": cb_id}
-        res = ops.read_slave_lora_conf(client, cb)
-        return res
-
-    result = await run_gateway_op(gateway_id, _wrap)
-    return result
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.read_slave_lora_conf)))
 
 
 @router.get("/{gateway_id}/slaves/{cb_id}/analog-bottom")
-async def slave_analog_bottom(gateway_id: int, cb_id: int,
+async def slave_analog_bottom(gateway_id: int, cb_id: int, mac: Optional[str] = None,
                               db: Session = Depends(get_db),
                               current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        return ops.read_slave_analog_bottom(client, {"id": cb_id})
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.read_slave_analog_bottom)))
 
 
 @router.get("/{gateway_id}/slaves/{cb_id}/analog-top")
-async def slave_analog_top(gateway_id: int, cb_id: int,
+async def slave_analog_top(gateway_id: int, cb_id: int, mac: Optional[str] = None,
                            db: Session = Depends(get_db),
                            current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        return ops.read_slave_analog_top(client, {"id": cb_id})
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.read_slave_analog_top)))
 
 
 @router.get("/{gateway_id}/slaves/{cb_id}/channel-map")
-async def slave_channel_map(gateway_id: int, cb_id: int,
+async def slave_channel_map(gateway_id: int, cb_id: int, mac: Optional[str] = None,
                             db: Session = Depends(get_db),
                             current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        return ops.read_slave_channel_map(client, {"id": cb_id})
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.read_slave_channel_map)))
 
 
 # --- Escrituras ---
 
 @router.post("/{gateway_id}/slaves/{cb_id}/lora")
 async def write_slave_lora(gateway_id: int, cb_id: int, data: LoraConfWriteIn,
+                           mac: Optional[str] = None,
                            db: Session = Depends(get_db),
                            current_user: User = Depends(require_admin)):
     _get_gateway(db, gateway_id)
-    # construir lora conf a partir de los flags/valores
     lora = _build_lora_from_flags(data)
-
-    def _wrap(client):
-        cb = {"id": cb_id}
-        return ops.write_slave_lora_conf(client, cb, lora, save_nvm=True)
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.write_slave_lora_conf, lora, save_nvm=True)))
 
 
 @router.post("/{gateway_id}/slaves/{cb_id}/analog-bottom")
 async def write_slave_analog_bottom(gateway_id: int, cb_id: int, channels: List[AnalogChannelIn],
+                                    mac: Optional[str] = None,
                                     db: Session = Depends(get_db),
                                     current_user: User = Depends(require_admin)):
     _get_gateway(db, gateway_id)
     chans = [c.dict() for c in channels]
-
-    def _wrap(client):
-        return ops.write_slave_analog_bottom(client, {"id": cb_id}, chans, save_nvm=True)
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.write_slave_analog_bottom, chans, save_nvm=True)))
 
 
 @router.post("/{gateway_id}/slaves/{cb_id}/analog-top")
 async def write_slave_analog_top(gateway_id: int, cb_id: int, channels: List[AnalogChannelIn],
+                                 mac: Optional[str] = None,
                                  db: Session = Depends(get_db),
                                  current_user: User = Depends(require_admin)):
     _get_gateway(db, gateway_id)
     chans = [c.dict() for c in channels]
-
-    def _wrap(client):
-        return ops.write_slave_analog_top(client, {"id": cb_id}, chans, save_nvm=True)
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.write_slave_analog_top, chans, save_nvm=True)))
 
 
 @router.post("/{gateway_id}/slaves/{cb_id}/channel-map")
 async def write_slave_channel_map(gateway_id: int, cb_id: int, data: ChannelMapIn,
+                                  mac: Optional[str] = None,
                                   db: Session = Depends(get_db),
                                   current_user: User = Depends(require_admin)):
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        return ops.write_slave_channel_map(client, {"id": cb_id}, data.channels, save_nvm=True)
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.write_slave_channel_map, data.channels,
+                              save_nvm=True)))
 
 
 @router.post("/{gateway_id}/slaves/{cb_id}/command")
 async def send_slave_cmd(gateway_id: int, cb_id: int, data: SlaveCmdIn,
+                         mac: Optional[str] = None,
                          db: Session = Depends(get_db),
                          current_user: User = Depends(require_admin)):
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        return ops.send_ssx_cmd(client, {"id": cb_id}, data.cmd, data.typ, data.save_nvm)
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.send_ssx_cmd, data.cmd, data.typ, data.save_nvm)))
 
 
 @router.post("/{gateway_id}/slaves/{cb_id}/zero")
 async def slave_zero(gateway_id: int, cb_id: int, data: Optional[dict] = None,
+                     mac: Optional[str] = None,
                      db: Session = Depends(get_db),
                      current_user: User = Depends(require_admin)):
     typ = (data or {}).get("typ", 3)
     _get_gateway(db, gateway_id)
-
-    def _wrap(client):
-        return ops.send_ssx_cmd(client, {"id": cb_id}, A.CMD_ZERO, typ, True)
-
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(
+        gateway_id, _slave_op(cb_id, mac, ops.send_ssx_cmd, A.CMD_ZERO, typ, True)))
 
 
 # =====================================================================
@@ -324,26 +340,25 @@ async def gateway_lora_scan(gateway_id: int, data: Optional[SlaveSelectIn] = Non
                             db: Session = Depends(get_db),
                             current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
-    selected_ids = set((data or {}).ids or []) if isinstance(data, SlaveSelectIn) or data else set()
+    selected_ids = set(data.ids or []) if data else set()
 
     def _wrap(client):
-        res = ops.get_cb_table(client)
-        if not res[0]:
-            return {"ok": False, "error": res[1].get("error")}
-        items = res[1].get("items", [])
+        items = ops.get_cb_items_cached(client, force=True)
+        if not items:
+            return {"ok": False, "error": "Tabla CB vacía o no accesible"}
         if selected_ids:
             items = [it for it in items if it.get("id") in selected_ids]
         return ops.scan_slaves(client, items)
 
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(gateway_id, _wrap))
 
 
 # =====================================================================
 # Gestión de archivos
 # =====================================================================
 
-@router.get("/{gateway_id}/files/{directory}")
-async def gateway_dir(gateway_id: int, directory: str,
+@router.get("/{gateway_id}/files")
+async def gateway_dir(gateway_id: int, directory: str = Query("LOGS/"),
                       db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
@@ -352,11 +367,12 @@ async def gateway_dir(gateway_id: int, directory: str,
     def _wrap(client):
         return ops.read_dir(client, directory)
 
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(gateway_id, _wrap))
 
 
-@router.get("/{gateway_id}/files/{directory}/{filename}")
-async def gateway_download_file(gateway_id: int, directory: str, filename: str,
+@router.get("/{gateway_id}/file")
+async def gateway_download_file(gateway_id: int, filename: str,
+                                directory: str = Query("LOGS/"),
                                 db: Session = Depends(get_db),
                                 current_user: User = Depends(get_current_user)):
     _get_gateway(db, gateway_id)
@@ -369,11 +385,12 @@ async def gateway_download_file(gateway_id: int, directory: str, filename: str,
             res.pop("data", None)
         return res
 
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(gateway_id, _wrap))
 
 
-@router.post("/{gateway_id}/files/{directory}/{filename}")
-async def gateway_upload_file(gateway_id: int, directory: str, filename: str, data: FileContentIn,
+@router.post("/{gateway_id}/file")
+async def gateway_upload_file(gateway_id: int, data: FileContentIn, filename: str,
+                              directory: str = Query("LOGS/"),
                               db: Session = Depends(get_db),
                               current_user: User = Depends(require_admin)):
     _get_gateway(db, gateway_id)
@@ -383,7 +400,7 @@ async def gateway_upload_file(gateway_id: int, directory: str, filename: str, da
     def _wrap(client):
         return ops.write_file(client, directory, filename, content)
 
-    return await run_gateway_op(gateway_id, _wrap)
+    return _check(await run_gateway_op(gateway_id, _wrap))
 
 
 # =====================================================================

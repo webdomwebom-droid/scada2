@@ -16,7 +16,7 @@ from typing import List
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 502
-DEFAULT_UNIT = 1
+DEFAULT_UNIT = 0
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 5.0
 MAX_REGISTERS = 120
@@ -82,7 +82,7 @@ class ModbusTcpClient:
         count = len(values)
         byte_count = count * 2
         tid = self._next_tid()
-        mbap = tid + struct.pack('>H', 0, 6 + 1 + byte_count)  # length = 6 + 1 + byte_count
+        mbap = tid + struct.pack('>HH', 0, 6 + 1 + byte_count)  # length = 6 + 1 + byte_count
         pdu = bytes([self.unit, 0x10,
                      (register >> 8) & 0xFF, register & 0xFF,
                      (count >> 8) & 0xFF, count & 0xFF,
@@ -108,8 +108,10 @@ class ModbusTcpClient:
 
     def _read_response(self):
         header = self._recv_exact(7)  # tid(2)+proto(2)+len(2)+unit(1)
-        # length es el tamaño de la PDU (func + data)
-        pdu_len = struct.unpack('>H', header[4:6])[0]
+        # length del MBAP cuenta unit + PDU; el unit ya viene en la cabecera leída
+        pdu_len = struct.unpack('>H', header[4:6])[0] - 1
+        if pdu_len <= 0:
+            raise IOError("Respuesta Modbus con longitud inválida")
         pdu = self._recv_exact(pdu_len)
         unit = header[6]
         function = pdu[0]

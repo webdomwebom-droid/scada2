@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     ALARM_REMINDER_DAYS: int = 7
 
     MODBUS_PORT: int = 502
+    # Unit ID usado por el control avanzado (multiGW usa 0 para hablar con el gateway)
+    GW_CONTROL_UNIT_ID: int = 0
     MODBUS_TIMEOUT: float = 5.0
 
     VPN_EXECUTABLE_OPENVPN: str = "C:\\Program Files\\OpenVPN\\bin\\openvpn.exe"
