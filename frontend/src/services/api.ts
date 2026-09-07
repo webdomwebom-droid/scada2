@@ -97,6 +97,8 @@ export const usersAPI = {
 }
 
 export const gwControlAPI = {
+  connection: (id: number) => api.get(`/gateways/${id}/connection`),
+  reconnect: (id: number) => api.post(`/gateways/${id}/reconnect`),
   status: (id: number) => api.get(`/gateways/${id}/status`),
   firmware: (id: number) => api.get(`/gateways/${id}/firmware`),
   sysConfig: (id: number) => api.get(`/gateways/${id}/sys-config`),
@@ -106,24 +108,35 @@ export const gwControlAPI = {
   command: (id: number, value: number) => api.post(`/gateways/${id}/command`, { value }),
   cbTable: (id: number) => api.get(`/gateways/${id}/cb-table`),
 
-  slaveLora: (id: number, cbId: number) => api.get(`/gateways/${id}/slaves/${cbId}/lora`),
-  slaveAnalogBottom: (id: number, cbId: number) => api.get(`/gateways/${id}/slaves/${cbId}/analog-bottom`),
-  slaveAnalogTop: (id: number, cbId: number) => api.get(`/gateways/${id}/slaves/${cbId}/analog-top`),
-  slaveChannelMap: (id: number, cbId: number) => api.get(`/gateways/${id}/slaves/${cbId}/channel-map`),
+  slaveLora: (id: number, cbId: number, mac?: string) =>
+    api.get(`/gateways/${id}/slaves/${cbId}/lora`, { params: { mac } }),
+  slaveAnalogBottom: (id: number, cbId: number, mac?: string) =>
+    api.get(`/gateways/${id}/slaves/${cbId}/analog-bottom`, { params: { mac } }),
+  slaveAnalogTop: (id: number, cbId: number, mac?: string) =>
+    api.get(`/gateways/${id}/slaves/${cbId}/analog-top`, { params: { mac } }),
+  slaveChannelMap: (id: number, cbId: number, mac?: string) =>
+    api.get(`/gateways/${id}/slaves/${cbId}/channel-map`, { params: { mac } }),
 
-  writeSlaveLora: (id: number, cbId: number, data: any) => api.post(`/gateways/${id}/slaves/${cbId}/lora`, data),
-  writeSlaveAnalogBottom: (id: number, cbId: number, channels: any[]) => api.post(`/gateways/${id}/slaves/${cbId}/analog-bottom`, channels),
-  writeSlaveAnalogTop: (id: number, cbId: number, channels: any[]) => api.post(`/gateways/${id}/slaves/${cbId}/analog-top`, channels),
-  writeSlaveChannelMap: (id: number, cbId: number, channels: number[]) => api.post(`/gateways/${id}/slaves/${cbId}/channel-map`, { channels }),
-  slaveCommand: (id: number, cbId: number, cmd: number) => api.post(`/gateways/${id}/slaves/${cbId}/command`, { cmd, typ: 3, save_nvm: true }),
-  slaveZero: (id: number, cbId: number) => api.post(`/gateways/${id}/slaves/${cbId}/zero`),
-  loraScan: (id: number) => api.post(`/gateways/${id}/lora-scan`, {}),
+  writeSlaveLora: (id: number, cbId: number, data: any, mac?: string) =>
+    api.post(`/gateways/${id}/slaves/${cbId}/lora`, data, { params: { mac } }),
+  writeSlaveAnalogBottom: (id: number, cbId: number, channels: any[], mac?: string) =>
+    api.post(`/gateways/${id}/slaves/${cbId}/analog-bottom`, channels, { params: { mac } }),
+  writeSlaveAnalogTop: (id: number, cbId: number, channels: any[], mac?: string) =>
+    api.post(`/gateways/${id}/slaves/${cbId}/analog-top`, channels, { params: { mac } }),
+  writeSlaveChannelMap: (id: number, cbId: number, channels: number[], mac?: string) =>
+    api.post(`/gateways/${id}/slaves/${cbId}/channel-map`, { channels }, { params: { mac } }),
+  slaveCommand: (id: number, cbId: number, cmd: number, mac?: string) =>
+    api.post(`/gateways/${id}/slaves/${cbId}/command`, { cmd, typ: 3, save_nvm: true }, { params: { mac } }),
+  slaveZero: (id: number, cbId: number, mac?: string) =>
+    api.post(`/gateways/${id}/slaves/${cbId}/zero`, {}, { params: { mac } }),
+  loraScan: (id: number, ids?: number[]) => api.post(`/gateways/${id}/lora-scan`, { ids: ids || null }),
 
-  dir: (id: number, directory: string) => api.get(`/gateways/${id}/files/${directory}`),
+  dir: (id: number, directory: string) =>
+    api.get(`/gateways/${id}/files`, { params: { directory } }),
   download: (id: number, directory: string, filename: string) =>
-    api.get(`/gateways/${id}/files/${directory}/${filename}`),
+    api.get(`/gateways/${id}/file`, { params: { directory, filename } }),
   upload: (id: number, directory: string, filename: string, data: string) =>
-    api.post(`/gateways/${id}/files/${directory}/${filename}`, { data })
+    api.post(`/gateways/${id}/file`, { data }, { params: { directory, filename } })
 }
 
 export default api

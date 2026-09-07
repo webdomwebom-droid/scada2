@@ -110,8 +110,9 @@ def set_ssx_id_mac(client: ModbusTcpClient, cb_id: int, mac_bytes: bytes) -> str
     if len(mac_bytes) < 8:
         mac_bytes = mac_bytes + b'\x00' * (8 - len(mac_bytes))
     buff = [int(cb_id) & 0xFF]
-    # empaquetar 8 bytes de mac en 4 registros (big-endian)
-    for i in range(4):
+    # Los registros van de menos a más significativo, igual que la MAC leída de la
+    # tabla CB y de GW_DATA_TO_FE: reg[0]=(m6,m7), reg[1]=(m4,m5), ...
+    for i in range(3, -1, -1):
         hi = mac_bytes[2 * i]
         lo = mac_bytes[2 * i + 1]
         buff.append((hi << 8) | lo)
@@ -157,8 +158,6 @@ def get_cb_table(client: ModbusTcpClient) -> tuple:
         if item.get("id") != 0:
             items.append(item)
         time.sleep(0.1)
-    if nslv != len(items):
-        return False, {"error": "CB table mismatch", "nslv": nslv, "items": items}
     return True, {"nslv": nslv, "items": items}
 
 
@@ -240,6 +239,38 @@ def _decode_cb_item(val: List[int]) -> dict:
 # Operaciones sobre un esclavo (tarjeta) seleccionado
 # =====================================================================
 
+_CB_CACHE = {}
+CB_CACHE_TTL = 300.0
+
+
+def get_cb_items_cached(client: ModbusTcpClient, force: bool = False) -> List[dict]:
+    """Items de la tabla CB con caché por gateway (evita releerla en cada operación)."""
+    key = (client.ip, client.port)
+    entry = _CB_CACHE.get(key)
+    if not force and entry and (time.time() - entry["ts"]) < CB_CACHE_TTL:
+        return entry["items"]
+    ok, data = get_cb_table(client)
+    if not ok:
+        return entry["items"] if entry else []
+    _CB_CACHE[key] = {"ts": time.time(), "items": data.get("items", [])}
+    return _CB_CACHE[key]["items"]
+
+
+def resolve_cb(client: ModbusTcpClient, cb_id: int, mac: Optional[str] = None) -> Optional[dict]:
+    """
+    Obtiene el item CB (id + MAC) necesario para seleccionar el esclavo.
+    La MAC es imprescindible: set_ssx_id_mac la envía al gateway para dirigir la
+    comunicación LoRa hacia ese esclavo.
+    """
+    if mac:
+        return {"id": int(cb_id), "mac": mac}
+    for force in (False, True):
+        for item in get_cb_items_cached(client, force=force):
+            if int(item.get("id", -1)) == int(cb_id):
+                return item
+    return None
+
+
 def _select_slave(client: ModbusTcpClient, cb: dict) -> str:
     """set_ssx_id_mac a partir de un item CB."""
     mac = codecs.mac_str_to_bytes(cb.get("mac", ""))
@@ -251,12 +282,12 @@ def read_slave_lora_conf(client: ModbusTcpClient, cb: dict) -> dict:
     err = _select_slave(client, cb)
     if err:
         return {"ok": False, "error": err}
-    err = client.write_multiple_registers(A.SLV_UPDATE_LORA_KEY, [0])
+    err = client.write_multiple_registers(A.SLV_UPDATE_CFG_LORA, [0])
     if err:
         return {"ok": False, "error": err}
     ok, status = wait_lora_updating(client)
     if not ok:
-        return {"ok": False, "error": "LoRa update error: " + codecs.lora_updating_to_text(
+        return {"ok": False, "error": "LoRa update error: " + A.lora_updating_to_text(
             status.get('lora_updating', -1) if status else -1)}
     val = client.read_input_registers(A.SLV_LORA_CONFIG, 10)
     if val is None:
@@ -373,12 +404,12 @@ def write_slave_lora_conf(client: ModbusTcpClient, cb: dict, lora: dict,
 def write_slave_analog_bottom(client: ModbusTcpClient, cb: dict, channels: List[dict],
                               save_nvm: bool = True) -> dict:
     regs = []
-    for i in range(18):
+    for i in range(20):
         ch = channels[i] if i < len(channels) else {"k": 3.3333, "offset": 0, "n_mean": 50}
         regs += codecs.encode_float_to_regs(float(ch.get("k", 3.3333)))
         regs += codecs.encode_float_to_regs(float(ch.get("offset", 0)))
         regs += codecs.encode_float_to_regs(float(ch.get("n_mean", 50)))
-    return write_slave_config(client, cb, A.ANALOG_CONF, regs, save_nvm)
+    return write_slave_config(client, cb, A.SLV_REG_CFG_ANALOGIN, regs, save_nvm)
 
 
 def write_slave_analog_top(client: ModbusTcpClient, cb: dict, channels: List[dict],
@@ -432,7 +463,7 @@ def scan_slaves(client: ModbusTcpClient, cb_list: List[dict]) -> dict:
             client.write_multiple_registers(A.SLV_UPDATE_REG_LORA, [0])
             ok, status = wait_lora_updating(client)
             if not ok:
-                scan = {"ok": False, "error": "LoRa: " + codecs.lora_updating_to_text(
+                scan = {"ok": False, "error": "LoRa: " + A.lora_updating_to_text(
                     status.get('lora_updating', -1) if status else -1),
                     "id": cb.get("id"), "mac": cb.get("mac")}
                 continue
@@ -451,7 +482,7 @@ def scan_slaves(client: ModbusTcpClient, cb_list: List[dict]) -> dict:
             break
         if scan:
             results.append(scan)
-    return {"ok": True, "results": results}
+    return {"ok": True, "items": results}
 
 
 def _to_signed(v: int) -> int:
@@ -464,22 +495,24 @@ def _to_signed(v: int) -> int:
 # Gestión de archivos (Process_files + ModbusOp)
 # =====================================================================
 
-def read_dir(client: ModbusTcpClient, directory: str) -> list:
+DIR_ADDRESSES = {
+    "LOGS/": A.OPEN_LOG_DIR,
+    "LOG/": A.OPEN_LOG_DIR,
+    "DATA/": A.OPEN_DATA_DIR,
+    "CBTB/": A.OPEN_CBTB_DIR,
+    "STDS/": A.OPEN_STDS_DIR,
+}
+
+
+def read_dir(client: ModbusTcpClient, directory: str) -> dict:
     """Lista los archivos de un directorio (LOGS/, DATA/, CBTB/, STDS/)."""
-    open_addr = {
-        "LOGS/": A.OPEN_LOG_DIR,
-        "DATA/": A.OPEN_DATA_DIR,
-        "CBTB/": A.OPEN_CBTB_DIR,
-        "STDS/": A.OPEN_STDS_DIR,
-    }
-    addr = open_addr.get(directory)
+    addr = DIR_ADDRESSES.get((directory or "").upper())
     if addr is None:
-        return None
+        return {"ok": False, "error": f"Directorio no soportado: {directory}",
+                "items": [], "directories": sorted(set(DIR_ADDRESSES))}
     response = client.read_input_registers(addr, 6)
-    if response is None:
-        return None
-    if len(response) < 6:
-        return None
+    if response is None or len(response) < 6:
+        return {"ok": False, "error": "No se pudo abrir el directorio", "items": []}
     file_list = []
     name = _regs_to_string(response)
     count = 0
@@ -491,7 +524,8 @@ def read_dir(client: ModbusTcpClient, directory: str) -> list:
         name = _regs_to_string(response)
         count += 1
     file_list.sort()
-    return file_list
+    return {"ok": True, "directory": directory,
+            "items": [{"name": n, "directory": False} for n in file_list]}
 
 
 def _regs_to_string(regs: List[int]) -> str:

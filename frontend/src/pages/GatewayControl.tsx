@@ -4,8 +4,10 @@ import { gwControlAPI, gatewaysAPI } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import {
   ArrowLeft, RefreshCw, Cpu, Radio, FileText, Terminal, Activity,
-  Loader, CheckCircle, Database, Download, Save, Wifi
+  Loader, CheckCircle, Database, Download, Save, Wifi, WifiOff, PlugZap
 } from 'lucide-react'
+
+const DIRECTORIES = ['LOGS/', 'DATA/', 'CBTB/', 'STDS/']
 
 type Tab = 'status' | 'grid' | 'conf' | 'commands' | 'scan' | 'files'
 
@@ -39,8 +41,12 @@ export default function GatewayControl() {
   const [scanResults, setScanResults] = useState<any[]>([])
 
   // Archivos
-  const [dir, setDir] = useState<string>('LOG/')
+  const [dir, setDir] = useState<string>('LOGS/')
   const [fileList, setFileList] = useState<any[]>([])
+
+  // Conexión (VPN/túnel) - para trabajo en campo
+  const [conn, setConn] = useState<any>(null)
+  const [reconnecting, setReconnecting] = useState(false)
 
   useEffect(() => {
     loadAll()
@@ -51,6 +57,31 @@ export default function GatewayControl() {
     setTimeout(() => setToast(null), 3500)
   }
 
+  const loadConnection = async () => {
+    try {
+      const res = await gwControlAPI.connection(gwId)
+      setConn(res.data)
+    } catch {
+      setConn(null)
+    }
+  }
+
+  const reconnect = async () => {
+    setReconnecting(true)
+    try {
+      await gwControlAPI.reconnect(gwId)
+      notify('ok', 'VPN reconectada y gateway respondiendo')
+      await loadConnection()
+      await loadStatus()
+      await loadGrid()
+    } catch (e: any) {
+      notify('err', e?.response?.data?.detail || 'No se pudo reconectar')
+      await loadConnection()
+    } finally {
+      setReconnecting(false)
+    }
+  }
+
   const loadAll = async () => {
     setLoading(true)
     try {
@@ -58,6 +89,7 @@ export default function GatewayControl() {
         gatewaysAPI.getById(gwId)
       ])
       setGateway(gw.data)
+      loadConnection()
       loadStatus()
       loadGrid()
     } catch (e: any) {
@@ -104,12 +136,16 @@ export default function GatewayControl() {
     }
   }
 
+  const macOf = (cbId: number | null) =>
+    cbItems.find(it => it.id === cbId)?.mac as string | undefined
+
   const selectSlave = async (cbId: number) => {
     setSelectedCb(cbId)
+    const mac = macOf(cbId)
     try {
       const [lora, ab] = await Promise.all([
-        gwControlAPI.slaveLora(gwId, cbId),
-        gwControlAPI.slaveAnalogBottom(gwId, cbId)
+        gwControlAPI.slaveLora(gwId, cbId, mac),
+        gwControlAPI.slaveAnalogBottom(gwId, cbId, mac)
       ])
       setSlaveLora(lora.data?.lora_conf || lora.data?.lora || lora.data)
       setAnalogBottom((ab.data?.channels) || [])
@@ -133,13 +169,13 @@ export default function GatewayControl() {
       pream_length: l.pream_length,
       fixed_pk_length: l.fixed_pk_length,
       frq: l.frq
-    }), 'Configuración LoRa guardada')
+    }, macOf(selectedCb)), 'Configuración LoRa guardada')
   }
 
   const scanLora = async () => {
     await run(async () => {
       const res = await gwControlAPI.loraScan(gwId)
-      setScanResults(res.data?.items || [])
+      setScanResults(res.data?.items || res.data?.results || [])
     }, 'Escaneo LoRa completado')
   }
 
@@ -147,9 +183,10 @@ export default function GatewayControl() {
     setDir(d)
     try {
       const res = await gwControlAPI.dir(gwId, d)
-      setFileList(res.data?.items || [])
+      const items = res.data?.items || []
+      setFileList(items.map((f: any) => (typeof f === 'string' ? { name: f, directory: false } : f)))
     } catch (e: any) {
-      notify('err', 'No se pudo listar el directorio')
+      notify('err', e?.response?.data?.detail || 'No se pudo listar el directorio')
     }
   }
 
@@ -214,9 +251,30 @@ export default function GatewayControl() {
             </p>
           </div>
         </div>
-        <button onClick={loadStatus} className="flex items-center gap-2 px-3 py-2 text-sm border rounded-lg hover:bg-gray-50">
-          <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} /> Refrescar
-        </button>
+        <div className="flex items-center gap-2">
+          <span
+            className={`flex items-center gap-2 px-3 py-2 text-sm rounded-lg border ${
+              conn?.vpn_ready ? 'bg-green-50 text-green-700 border-green-200'
+                : 'bg-red-50 text-red-700 border-red-200'
+            }`}
+            title={conn?.vpn_plant ? `VPN: ${conn.vpn_plant}` : 'Sin túnel activo'}
+          >
+            {conn?.vpn_ready ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
+            {conn?.vpn_ready ? `VPN ${conn?.plant || ''}` : 'VPN desconectada'}
+            {conn?.demo && <span className="text-xs">(demo)</span>}
+          </span>
+          <button
+            onClick={reconnect}
+            disabled={reconnecting}
+            className="flex items-center gap-2 px-3 py-2 text-sm bg-amber-500 text-white rounded-lg hover:bg-amber-600 disabled:opacity-50"
+            title="Cierra el túnel y vuelve a conectar (uso en campo)"
+          >
+            {reconnecting ? <Loader className="w-4 h-4 animate-spin" /> : <PlugZap className="w-4 h-4" />} Reconectar
+          </button>
+          <button onClick={() => { loadConnection(); loadStatus() }} className="flex items-center gap-2 px-3 py-2 text-sm border rounded-lg hover:bg-gray-50">
+            <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} /> Refrescar
+          </button>
+        </div>
       </div>
 
       {toast && (
@@ -488,10 +546,10 @@ export default function GatewayControl() {
                 {selectedCb !== null ? `Aplicando a esclavo CB#${selectedCb}` : 'Seleccione primero un esclavo en la pestaña Tabla CB'}
               </p>
               <div className="space-y-2">
-                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveZero(gwId, selectedCb), 'ZERO enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando ZERO</button>
-                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveCommand(gwId, selectedCb, 1), 'Comando enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando 1</button>
-                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveCommand(gwId, selectedCb, 2), 'Comando enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando 2</button>
-                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveCommand(gwId, selectedCb, 3), 'Comando enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando 3</button>
+                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveZero(gwId, selectedCb, macOf(selectedCb)), 'ZERO enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando ZERO</button>
+                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveCommand(gwId, selectedCb, 1, macOf(selectedCb)), 'Comando enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando 1</button>
+                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveCommand(gwId, selectedCb, 2, macOf(selectedCb)), 'Comando enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando 2</button>
+                <button onClick={() => selectedCb !== null && run(() => gwControlAPI.slaveCommand(gwId, selectedCb, 3, macOf(selectedCb)), 'Comando enviado')} disabled={!isAdmin || selectedCb === null} className="w-full text-left px-4 py-2 border rounded-lg hover:bg-gray-50 text-sm disabled:opacity-50">Enviar comando 3</button>
               </div>
             </div>
           </div>
@@ -539,6 +597,17 @@ export default function GatewayControl() {
           <div className="bg-white rounded-xl shadow-sm border p-5">
             <div className="flex items-center gap-2 mb-4 flex-wrap">
               <h3 className="font-semibold text-gray-800">Gestión de archivos</h3>
+              {DIRECTORIES.map(d => (
+                <button
+                  key={d}
+                  onClick={() => loadDir(d)}
+                  className={`px-3 py-1.5 rounded-lg text-sm border ${
+                    dir === d ? 'bg-blue-600 text-white border-blue-600' : 'hover:bg-gray-50'
+                  }`}
+                >
+                  {d.replace('/', '')}
+                </button>
+              ))}
               <input
                 value={dir}
                 onChange={e => setDir(e.target.value)}
